@@ -1,0 +1,180 @@
+#!/usr/bin/env python
+# git-squash-pull-request
+# Copyright (C) 2013  X-Team
+# Weston Ruter (@westonruter) <weston@x-team.com>
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+'''
+Squash merge a pull request branch
+
+Consider there is a pull request #5 open for an issue "FOO-123", and there is a
+corresponding branch FOO-123 for which the pull request is issued for, and the
+remote origin's URL is:
+
+  git@github.com:x-team/example.git
+
+This script may be minimally invoked as:
+
+  $ git-squash-pull-request 5
+
+This will result in a squashed merge commit into the current branch; the
+commit message would be "FOO-123" and its author would be set to whoever made
+the most commits in that branch.
+
+commit adc83b19e793491b1c6ea0fd8b46cd9f32e592fc
+Author: John Smith <john.smith@example.com>
+Date:   Fri Mar 29 00:32:24 2013 -0700
+
+    FOO-123
+
+    Close x-team/example#5
+
+    Squashed commit of the following:
+    ...
+
+When this commit is pushed to GitHub, it will automatically close the pull
+request in the example repo.
+
+Usually you will want to supply a --message argument to make the squashed commit
+message match the pull request title or the ticket summary, for example:
+
+  $ git-squash-pull-request 5 -m "FOO-123: Add feature bar"
+
+In the future, it would be nice to programmatically obtain the pull request
+title via the GitHub API: http://developer.github.com/v3/pulls/#get-a-single-pull-request
+
+'''
+
+import subprocess
+import sys
+import argparse
+import re
+
+class GitSquashPullRequest():
+
+    def __init__(self, argv):
+        parser = argparse.ArgumentParser(
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            description=__doc__,
+            epilog='/five'
+        )
+        parser.add_argument('-a', '--author',
+            type=str,
+            action='store',
+            help="The author name and email to attribute to the commit, defaulting to most prolific author on branch",
+        )
+        parser.add_argument('-r', '--remote',
+            type=str,
+            action='store',
+            default='origin',
+            help="The name of the remote from which to obtain the pull request",
+        )
+        parser.add_argument('-m', '--message',
+            type=str,
+            action='store',
+            help="The message used for the commit subject, defaulting to the source branch name",
+        )
+        parser.add_argument('pull_request',
+            type=int,
+            nargs=1,
+            help="The pull request number that this closes",
+        )
+
+        args = parser.parse_args(argv)
+        args.pull_request = args.pull_request[0]
+
+        # Find the commit that a pull request is pointing to
+        pull_head_ref = 'refs/pull/%d/head' % args.pull_request
+        ls_remotes = subprocess.check_output(['git', 'ls-remote', args.remote, pull_head_ref]).strip()
+        if not ls_remotes:
+            raise Exception('Expected only one git-ls-remote result for %s' % pull_head_ref)
+        subprocess.check_call(['git', 'fetch', args.remote])
+        self.pull_head_commit = ls_remotes.split("\n")[0].split("\t")[0]
+
+        # Find the name of the branch that corresponds to the opened pull request
+        name_revs = subprocess.check_output(['git', 'name-rev', '--name-only', self.pull_head_commit]).strip()
+        if not name_revs:
+            raise Exception('No rev-names for %s' % self.pull_head_commit)
+        self.name_revs = name_revs.split("\n")
+        self.branch_name = re.sub(r'^.*/', '', self.name_revs[0])
+
+        if not args.message:
+            args.message = self.branch_name
+        if not args.author:
+            args.author = self.get_most_prolific_author(self.name_revs[0], self.get_checked_out_branch())
+
+        self.__dict__.update(args.__dict__)
+
+
+    def get_github_repo_name(self, remote):
+        url = subprocess.check_output(['git', 'config', 'remote.%s.url' % remote])
+        matches = re.match(r'^git@github\.com:(.+)\.git$', url)
+        assert(matches)
+        return matches.group(1)
+
+
+    def get_checked_out_branch(self):
+        return subprocess.check_output(['git', 'rev-parse', '--abbrev-ref', 'HEAD']).strip()
+
+
+    def get_most_prolific_author(self, source_branch, omit_branch):
+        cmd = [
+            'git',
+            'shortlog',
+            '-sne',
+            '^' + omit_branch,
+            source_branch
+        ]
+        first_line = subprocess.check_output(cmd).split("\n")[0]
+        (count, author) = re.split(r'\t', first_line.strip(), 1)
+        return author
+
+
+    def get_git_dir(self):
+        return subprocess.check_output(['git', 'rev-parse',
+        '--show-toplevel']).strip()
+
+    def merge(self):
+        subprocess.check_call(['git', 'merge', '--squash', self.pull_head_commit])
+
+        squash_msg_file = '%s/.git/SQUASH_MSG' % self.get_git_dir()
+        with open(squash_msg_file) as f:
+            squash_msg = f.read()
+
+        squash_msg = "%s\n\nClose %s#%d\n\n%s" % (
+            self.message,
+            self.get_github_repo_name(self.remote),
+            self.pull_request,
+            squash_msg
+        )
+
+        with open(squash_msg_file, mode='w') as f:
+            f.write(squash_msg)
+
+        cmd = [
+            'git',
+            'commit',
+            '--no-verify',
+            '--author',
+            self.author
+        ]
+        print ' '.join(cmd)
+        subprocess.check_call(cmd)
+
+
+if __name__ == '__main__':
+    cmd = GitSquashPullRequest(sys.argv[1:])
+    cmd.merge()
+

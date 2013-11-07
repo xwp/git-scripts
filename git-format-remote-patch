@@ -1,0 +1,330 @@
+#!/usr/bin/env python
+# git-format-remote-patch
+# Copyright (C) 2013  X-Team
+# Weston Ruter (@westonruter) <weston@x-team.com>
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+
+'''
+Generate patches for a file/directory (object) in the destination branch (repo
+remote) that was once identical to the object in the source branch. The object
+need not exist at the same path in each repo, as the paths that appear in the
+patch will get translated to whatever the destination paths are. The script
+gathers a list of the commits applicable to the path in the source and
+destination and gathers up the blob/tree (object) hash for the path at each
+commit. It then finds the most recent commit in the source branch where the path
+has an object hash identical to the object hash for the path in the destination
+branch. This commit hash then can be supplied to git-format-patch on source
+branch to obtain the patches for all changes made to the path since the time
+that the paths were identical. The patches are output to STDOUT.
+
+Examples
+========
+$ git-format-remote-patch HEAD:lib/ remotes/stale-project/master:lib/ > lib.patch
+$ git-format-remote-patch remotes/foolib/master:src/ HEAD:lib/foo/ | git am
+
+Incorporate lessphp into project and keep up to date
+----------------------------------------------------
+$ git remote add lessphp https://github.com/leafo/lessphp.git
+$ git config remote.lessphp.tagopt --no-tags
+$ git fetch lessphp
+$ tag_ref=$(git ls-remote --tags lessphp refs/tags/v0.3.7 | cut -f1)
+$ mkdir lessphp && git archive $tag_ref | tar -x -C lessphp
+$ git add lessphp && git commit -m "Add old version of lessphp"
+... work on project ...
+$ git checkout -b remote-patch
+$ tag_ref=$(git ls-remote --tags lessphp refs/tags/v0.3.8 | cut -f1)
+$ git-format-remote-patch $tag_ref:./ HEAD:lessphp/ | git am --3way
+    ... if there was a conflict, then fix them and ...
+    $ git add FILE
+    $ git am --resolved
+$ git checkout master
+$ git merge --squash remote-patch
+$ git commit
+$ git branch -D remote-patch
+
+'''
+
+import subprocess
+import os
+import argparse
+import sys
+import re
+import uuid
+import textwrap
+
+def console(msg):
+    sys.stderr.write(str(msg) + "\n")
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=__doc__,
+        epilog='/five'
+    )
+
+    parser.add_argument('-s', '--since',
+        type=str,
+        action='store',
+        help="Specify the commit in the remote that should be used as the starting point for the range of commits to use when obtaining the patches. If you've previously applied patches which had a conflict that you had to resolve, you'll want to use this in order to avoid having to re-resolve the conflict each time. This prevents the patches from being generated from the point in time when the local and remote path were identical, and instead geneates the patches from the supplied commit onwards. It's a short-circuit of sorts.",
+    )
+    parser.add_argument('--squashing',
+        choices=('never', 'auto', 'always',),
+        default='auto',
+        help="Specify the commit in the remote that should be used as the starting point for the range of commits to use when obtaining the patches. If you've previously applied patches which had a conflict that you had to resolve, you'll want to use this in order to avoid having to re-resolve the conflict each time. This prevents the patches from being generated from the point in time when the local and remote path were identical, and instead geneates the patches from the supplied commit onwards. It's a short-circuit of sorts.",
+    )
+    parser.add_argument('-v', '--verbose',
+        action='store_true',
+        help="Show additional logging",
+    )
+    parser.add_argument('src',
+        type=str,
+        help="The source object <rev>:<path> to obtain patches from, where the <rev> defaults to HEAD <path> to the root directory.",
+    )
+    parser.add_argument('dst',
+        type=str,
+        help="The destination object <rev>:<path> to generate patches for, where <path> defaults to the src path.",
+    )
+    parser.add_argument('pass_thru_arg',
+        type=str,
+        nargs='*',
+        help="Additional arguments to pass along to git-format-patch. These arguments must be preceded by a -- to delineate where to start globbing these arguments.",
+    )
+    args = parser.parse_args()
+
+    if not os.path.exists('.git'):
+        raise Exception('Must be executed from the git root')
+
+    args.src_rev = None
+    args.src_path = None
+    args.dst_rev = None
+    args.dst_path = None
+
+    if ':' not in args.src:
+        raise Exception('Expected ":" in src argument "%s" to eliminate ambiguity' % args.src)
+    (args.src_rev, args.src_path) = args.src.split(':', 2)
+    if not args.src_rev:
+        args.src_rev = 'HEAD'
+        if args.verbose:
+            console('Assuming src_rev is HEAD')
+    if not args.src_path:
+        args.src_path = './'
+
+    if ':' not in args.dst:
+        raise Exception('Expected ":" in dst argument "%s" to eliminate ambiguity' % args.dst)
+    (args.dst_rev, args.dst_path) = args.dst.split(':', 2)
+    if not args.dst_rev:
+        args.dst_rev = 'HEAD'
+        if args.verbose:
+            console('Assuming dst_rev is HEAD')
+    if not args.dst_path:
+        args.dst_path = args.src_path
+        if args.verbose:
+            console('Assuming dst_path is %s (src_path)' % args.src_path)
+
+    rev_path_pairs = (
+        (args.src_rev, args.src_path),
+        (args.dst_rev, args.dst_path)
+    )
+    for rev_path in rev_path_pairs:
+        subprocess.check_call(['git', 'cat-file', '-e', '%s:%s' % rev_path])
+
+    return args
+
+
+class ObjectCommitHashSet:
+    def __init__(self, commit_hash, object_hash = None, object_type = None):
+        self.commit_hash = commit_hash
+        self.object_hash = object_hash
+        self.object_type = object_type
+    def __str__(self):
+        return '%s <%s> %s' % (self.commit_hash, self.object_type, self.object_hash)
+
+
+def get_commit_object_hashes(rev, path):
+    cmd = ['git', 'log', '--pretty=format:%H:%T', rev, '--', path]
+    commit_object_hash_sets = []
+    for entry in subprocess.check_output(cmd).strip().split("\n"):
+        (commit_hash, root_tree_hash) = entry.split(':')
+        hash_set = ObjectCommitHashSet(commit_hash, None, None)
+        if path in ('', '.', './'):
+            hash_set.object_hash = root_tree_hash
+            hash_set.object_type = 'tree'
+        else:
+            # @todo It seems there must be a better way to find the object hash than to use ls-tree
+            cmd = ['git', 'ls-tree', commit_hash, '--', path.rstrip('/')]
+            ls_tree = subprocess.check_output(cmd).strip()
+            if len(ls_tree.split("\n")) != 1:
+                raise Exception('Failed to get a single result from ls-tree as required: ' + ' '.join(cmd))
+            matches = re.match(r"(?P<mode>\S+) (?P<type>\S+) (?P<object>\S+)\t(?P<file>.+)", ls_tree)
+            if not matches:
+                # This will happen if the file was previously deleted at a point in time
+                break
+            hash_set.object_type = matches.group('type')
+            hash_set.object_hash = matches.group('object')
+        commit_object_hash_sets.append(hash_set)
+
+    return commit_object_hash_sets
+
+
+def main():
+    args = parse_args()
+    console("Generating patches from:\n%s:%s\nto apply to:\n%s:%s" % (args.src_rev, args.src_path, args.dst_rev, args.dst_path))
+
+    src_commit_object_hash_sets = get_commit_object_hashes(args.src_rev, args.src_path)
+    dst_commit_object_hash_sets = get_commit_object_hashes(args.dst_rev, args.dst_path)
+    if len(src_commit_object_hash_sets) == 0:
+        raise Exception('There are no commits in the source to search')
+    if len(dst_commit_object_hash_sets) == 0:
+        raise Exception('There are no commits in the destination to search')
+    subject_object_type = src_commit_object_hash_sets[0].object_type
+    assert(subject_object_type == dst_commit_object_hash_sets[0].object_type)
+
+    if args.verbose:
+        console('Searching src/dst commit histories for supplied path to find identical object state between:')
+        console('%d tree(s) in %s and %d tree(s) in %s' % (
+            len(src_commit_object_hash_sets),
+            args.src_rev,
+            len(dst_commit_object_hash_sets),
+            args.dst_rev
+        ))
+
+    has_matched_since = False
+    pending_src_commit_hashes = []
+    matching_src_commit_hash = None
+    get_src_commit_info = lambda commit_hash: subprocess.check_output(['git', 'log', '--pretty=format:%h %ai %ae %s', '-1', commit_hash])
+    for src_hash_set in src_commit_object_hash_sets:
+        if args.since and src_hash_set.commit_hash.startswith(args.since):
+            console('MATCHING, arrived at supplied since: %s' % (get_src_commit_info(src_hash_set.commit_hash)))
+            matching_src_commit_hash = src_hash_set.commit_hash
+            has_matched_since = True
+            break
+
+        for dst_hash_set in dst_commit_object_hash_sets:
+            if src_hash_set.object_hash == dst_hash_set.object_hash:
+                matching_src_commit_hash = src_hash_set.commit_hash
+                break
+
+        if matching_src_commit_hash is None:
+            console('PENDING: %s' % get_src_commit_info(src_hash_set.commit_hash))
+            pending_src_commit_hashes.append(src_hash_set.commit_hash)
+        else:
+            console('MATCHING: %s' % get_src_commit_info(src_hash_set.commit_hash))
+            break
+
+    if not has_matched_since and args.since:
+        console('WARNING: Supplied --since was never matched. Make sure it refers to a commit that touched the supplied path.')
+
+    if len(pending_src_commit_hashes) == 0:
+        console('Nothing to patch. Already up to date.')
+        return
+
+    if matching_src_commit_hash is None:
+        raise Exception("Unable to find a point in the two branch histories where the paths had the same state")
+
+    console('Found %d applicable commit(s) for patching (%s..%s)' % (
+        len(pending_src_commit_hashes),
+        matching_src_commit_hash[0:7],
+        pending_src_commit_hashes[0][0:7]
+    ))
+
+    # Detect if there are any merge commits to be applied, and if so automatically do a squash
+    should_squash = (args.squashing == 'always')
+    if args.squashing == 'auto':
+        cmd = [
+            'git',
+            'log',
+            '--pretty=format:%p',
+            '%s..%s' % (matching_src_commit_hash, args.src_rev),
+            '--',
+            args.src_path
+        ]
+        merge_commit_count = 0
+        parents_log = subprocess.check_output(cmd).strip().split("\n")
+        for parents in parents_log:
+            if len(parents.split(' ')) > 1:
+                merge_commit_count += 1
+        should_squash = (merge_commit_count > 0)
+        if should_squash:
+            console('With squashing=auto, due to %d merge commit(s) cannot use git-format-patch so the commits must be squashed.' % merge_commit_count)
+        else:
+            console('There were no merge commit(s) so git-format-patch can be used to preserve commit history. Commits will not be squashed.')
+
+    patch_header = ''
+    if not should_squash or len(pending_src_commit_hashes) == 1:
+        cmd = [
+            'git',
+            'format-patch',
+            '--no-stat',
+            '--stdout',
+        ]
+    else:
+        cmd = [
+            'git',
+            'diff',
+            '--full-index',
+        ]
+        patch_header += "From: %s <%s>\n" % (
+            subprocess.check_output(['git', 'config', '--get', 'user.name']).strip(),
+            subprocess.check_output(['git', 'config', '--get', 'user.email']).strip()
+        )
+        patch_header += "Subject: Apply {count} squashed remote commits {start}..{end}\n\n{src_rev}:{src_path}\n=>\n{dst_rev}:{dst_path}\n\n".format(
+            count = len(pending_src_commit_hashes),
+            start = matching_src_commit_hash[0:7],
+            end = pending_src_commit_hashes[0][0:7],
+            src_rev = args.src_rev,
+            src_path = args.src_path,
+            dst_rev = args.dst_rev,
+            dst_path = args.dst_path,
+        )
+        patch_header += "Squashed commit of the following:\n\n"
+        for commit in pending_src_commit_hashes:
+            patch_header += subprocess.check_output(['git', 'log', '-1', '--pretty=medium', commit]) + "\n"
+        patch_header += "\n\n"
+
+    cmd.extend(args.pass_thru_arg)
+
+    uniq_prefix = str(uuid.uuid4())
+    cmd.append('--src-prefix=a/%s' % uniq_prefix)
+    cmd.append('--dst-prefix=b/%s' % uniq_prefix)
+    cmd.append('%s..%s' % (matching_src_commit_hash, args.src_rev))
+    cmd.append('--')
+    cmd.append(args.src_path)
+    if args.verbose:
+        console(' '.join(cmd))
+    patches = subprocess.check_output(cmd)
+
+    # Replace placeholder path prefixes with the actual paths
+    # This allows the patch to be cleanly applied if the paths are not the same
+    def normalize_path(path):
+        path = re.sub(r'^\./?', '', path).rstrip('/')
+        if path != '' and subject_object_type == 'tree':
+            path += '/'
+        return path
+    normalized_src_path = normalize_path(args.src_path)
+    normalized_dst_path = normalize_path(args.dst_path)
+    patches = patches.replace(
+        uniq_prefix + normalized_src_path,
+        normalized_dst_path
+    )
+
+    print patch_header + patches
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as e:
+        console(str(e))
+        sys.exit(1)

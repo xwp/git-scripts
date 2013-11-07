@@ -1,0 +1,559 @@
+#!/usr/bin/env python
+# git-apply-remote-patches
+# Copyright (C) 2013  X-Team
+# Weston Ruter (@westonruter) <weston@x-team.com>
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+
+'''
+Apply patches from multiple remotes utilizing git-format-remote-patch
+
+This script can be thought of as a higher level abstraction of git-am in that
+it iterates over the supplied remote definitions and invokes git-am on each of
+them. All remotes patches are applied on a tertiary topic branch, which are then
+merged into a secondary staging branch before finally being merged back into the
+original branch from which the script was invoked.
+
+The remotes definition manifest consists of 3-4 columns, where the remote_path
+defaults to being the same as the local_path. For example:
+
+  # remote_name   remote_ref          local_path   remote_path
+  foolib          refs/heads/master   /lib/foo     /
+  akismet         refs/heads/release  /wp-content/plugins/akismet
+
+Assuming this file is named remote-srcs.txt, the script may be invoked via:
+$ git-apply-remote-patches remote-srcs.txt
+
+It will loop over all definitions in the provided file and apply each set of
+patches to a separate topic branch that gets merged into a staging branch, as
+mentioned previously. If there is a git-am conflict, the script will halt and
+will allow you to resolve the conflict and proceed with:
+$ git add CONFLICTED_FILE
+Followed by:
+$ git am --continue
+Or if the resolved conflict yields no change to apply, then you proceed with:
+$ git am --skip
+
+After this, you can continue running the the patches from the other remotes via:
+$ git-apply-remote-patches --continue
+Or if you want to skip applying the patches from the current remote entirely:
+$ git-apply-remote-patches --skip
+
+Lastly, if you want to abort the entire process and return to your original
+branch, you simply run:
+$ git-apply-remote-patches --abort
+
+Sending a keyboard interrupt (^C, Control-C) will also abort the process.
+'''
+
+# todo: Add a --stop option which aborts applying the patches for the current remote path and keep any preceding
+# todo: Add an option to ignore looking through the log to see if the patches have already been applied
+
+import subprocess
+import os
+import argparse
+import sys
+import re
+import textwrap
+import shelve
+import shutil
+
+
+class GitApplyRemotePatches:
+
+    staging_branch = 'APPLY-REMOTE-PATCHES'
+    topic_branch = 'APPLY-REMOTE-PATCHES-FOR-PATH'
+    state_dir = '.git-apply-remote-patches'
+    remote_ref_head_cache = dict()
+    fetched_remote_names = set()
+    git_format_remote_patch_script_name = 'git-format-remote-patch'
+
+    def __init__(self, args):
+        if not os.path.exists('.git'):
+            raise ScriptException('Expected current working directory to be git root')
+        self.args = self.parse_args(args)
+        if not os.path.isdir(self.state_dir):
+            os.mkdir(self.state_dir)
+        shelf_path = os.path.join(self.state_dir, 'state')
+        self.shelf = shelve.open(shelf_path, writeback=True)
+
+        if self.is_initial_invocation():
+            self.load_remotes_manifest_files()
+            assert(not self.is_on_working_branch())
+            self.shelf['original_branch'] = get_checked_out_branch()
+            self.shelf['initial_head'] = subprocess.check_output(['git', 'rev-parse', 'HEAD']).strip()
+            self.shelf['is_dry_run'] = self.args.is_dry_run
+
+        self.git_format_remote_patch_script_path = self.get_git_format_remote_patch_script_path()
+
+    def console(self, msg = ''):
+        sys.stdout.write(str(msg) + "\n")
+
+    def parse_args(self, argv):
+        parser = argparse.ArgumentParser(
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            description=__doc__,
+            epilog='/five'
+        )
+
+        parser.add_argument('--continue',
+            action='store_true',
+            help="Indicate that the git-am conflict has been resolved to continue applying the patches",
+            dest='is_continue'
+        )
+        parser.add_argument('--abort',
+            action='store_true',
+            help="Return to the original branch and throw away an in-process application of remote patches",
+            dest='is_abort'
+        )
+        parser.add_argument('--skip',
+            action='store_true',
+            help="Skip the application of all the patches for the current remote path definition (git am --abort). To skip an individual conflicting patch, use `git am --skip`",
+            dest='is_skip'
+        )
+        parser.add_argument('--dry-run',
+            action='store_true',
+            help="Skip merging in staging branch at the end",
+            dest='is_dry_run'
+        )
+        parser.add_argument('remotes_manifest',
+            type=str,
+            nargs='*',
+            help="Location of file containing 4-column definit ion of remote name, remote ref, the local path, and the remote path (which defaults to the local path if not defined). Supply - to read from STDIN.",
+        )
+        args = parser.parse_args(argv)
+
+        in_process_flag_count = sum(map(int, [args.is_continue, args.is_abort, args.is_skip]))
+        if in_process_flag_count > 1:
+            raise ScriptException('You may specify only ony of either --continue, --skip, or --abort.')
+
+        if len(args.remotes_manifest) == 0 and in_process_flag_count == 0:
+            raise ScriptException('You must supply the manifest(s) at first run, if not a conflicted state in which case --continue, --abort, or --skip may be used')
+
+        if len(args.remotes_manifest) != 0 and in_process_flag_count != 0:
+            raise ScriptException('You may only supply a remotes manifest when first invoking the script, not when --continue, --abort, or --skip are used')
+
+        if args.is_dry_run and in_process_flag_count != 0:
+            raise ScriptException('It is only applicable to supply --dry-run when first invoking the script')
+
+        return args
+
+
+    def load_remotes_manifest_files(self):
+        self.shelf['remote_def_index'] = 0
+        self.shelf['remotes_manifest'] = []
+        for remotes_manifest_file in self.args.remotes_manifest:
+            if remotes_manifest_file == '-':
+                lines = sys.stdin.readlines()
+            else:
+                with open(remotes_manifest_file) as f:
+                    lines = f.readlines()
+
+            for line in lines:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                cols = re.split(r'\s+', line, 3)
+                if len(cols) < 3 or len(cols) > 4:
+                    raise InvalidManifest('Expected 3-4 columns: remote_name, remote_ref, local_path, and optionally remote_path but in %s got: "%s"' % (remotes_manifest_file, line))
+                remote_def = RemoteDefinition(*cols)
+                self.shelf['remotes_manifest'].append(remote_def)
+
+    def get_remote_def_count(self):
+        return len(self.shelf.get('remotes_manifest', []))
+
+    def get_current_remote_def(self):
+        return self.shelf['remotes_manifest'][self.shelf['remote_def_index']]
+
+    def has_more_remote_defs(self):
+        return self.shelf['remote_def_index'] < self.get_remote_def_count()
+
+    def next_remote_def(self):
+        self.shelf['remote_def_index'] += 1
+        self.shelf.sync()
+
+    def get_git_format_remote_patch_script_path(self):
+        try:
+            return subprocess.check_output(['which', self.git_format_remote_patch_script_name]).strip()
+        except:
+            pass
+        try:
+            search_paths = [
+                '.',
+                os.path.dirname(__file__),
+                'bin',
+            ]
+            for search_path in search_paths:
+                script_path = os.path.join(search_path, self.git_format_remote_patch_script_name)
+                if os.path.exists(script_path):
+                    return script_path
+        except:
+            pass
+        raise ScriptException('Unable to locate %s' % self.git_format_remote_patch_script_name)
+
+    def is_initial_invocation(self):
+        return not (self.args.is_continue or self.args.is_abort or self.args.is_skip)
+
+    def do_skip(self):
+        remote_def = self.get_current_remote_def()
+        self.console('Skipping %s' % remote_def)
+        if get_checked_out_branch() != self.topic_branch:
+            raise ScriptException('When using --skip, it is expected that you would be in the %s branch' % self.topic_branch)
+        subprocess.call(['git', 'am', '--abort'])
+        subprocess.check_call(['git', 'reset'])
+        subprocess.check_call(['git', 'checkout', self.staging_branch])
+        subprocess.check_call(['git', 'branch', '-D', self.topic_branch])
+        self.next_remote_def()
+
+    def do_continue(self):
+        remote_def = self.get_current_remote_def()
+        self.console('Continuing with %s' % remote_def)
+        if is_git_am_state():
+            raise ScriptException(textwrap.dedent('''
+                You are currently in a git-am state.
+                You must first finish applying the current patches with:
+                $ git add FILE
+                Followed by:
+                $ git am --continue
+                or
+                $ git am --skip
+            '''))
+        if get_checked_out_branch() != self.topic_branch:
+            raise ScriptException('When using --continue, it is expected that you would be in the %s branch' % self.topic_branch)
+        subprocess.check_call(['git', 'checkout', self.staging_branch])
+        subprocess.check_call(['git', 'merge', '--no-ff', '--no-commit', self.topic_branch])
+        cmd = [
+            'git',
+            'commit',
+            '--allow-empty',
+            '--no-verify',
+            '-m',
+            remote_def.get_commit_message()
+        ]
+        subprocess.check_call(cmd)
+        subprocess.check_call(['git', 'branch', '-D', self.topic_branch])
+        self.next_remote_def()
+
+    def do_abort(self):
+        self.console('Aborting...')
+        if is_git_am_state():
+            subprocess.call(['git', 'am', '--abort'])
+        subprocess.call(['git', 'reset'])
+        self.cleanup()
+
+    def cleanup(self):
+        current_branch = get_checked_out_branch()
+        if self.shelf.get('original_branch', False) and current_branch in (self.topic_branch, self.staging_branch):
+            subprocess.check_call(['git', 'checkout', self.shelf['original_branch']])
+        if is_branch_existing(self.staging_branch):
+            subprocess.call(['git', 'branch', '-D', self.staging_branch])
+        if is_branch_existing(self.topic_branch):
+            subprocess.call(['git', 'branch', '-D', self.topic_branch])
+        self.shelf.close()
+        shutil.rmtree(self.state_dir)
+
+    def process_remote_def(self, remote_def):
+        self.console()
+        self.console('#' * 80)
+        self.console('Processing %s' % remote_def)
+
+        # Check our logs for the last remote path HEAD that was applied to our path
+        # git-format-remote-patch --since=abc123d HEAD:lib/ remotes/stale-project/master:lib/
+        # If there have been no commits on the remote betweem that ref and the remote's current path HEAD,
+        # then do nothing
+        remote_since_limit = None
+        commit_subject_pattern = remote_def.get_commit_log_search_pattern()
+        cmd = [
+            'git',
+            'log',
+            '--pretty=format:%s',
+            '-1',
+            '-i',
+            '--extended-regexp',
+            '--grep=%s' % commit_subject_pattern
+        ]
+        last_applied_remote_commit_subject = subprocess.check_output(cmd).strip()
+        if last_applied_remote_commit_subject:
+            matches = re.match(commit_subject_pattern, last_applied_remote_commit_subject)
+            assert(matches and len(matches.groups()) == 1)
+            remote_since_limit = matches.group(1)
+            self.console('Patches from remote path have been applied before. Limiting to changes since %s' % remote_since_limit)
+
+        # Generate the patch from the remote
+        patch_filename = os.path.join(self.state_dir, 'remote.patch')
+        with open(patch_filename, mode='w') as f:
+            cmd = [
+                'python',
+                self.git_format_remote_patch_script_path,
+            ]
+            if remote_since_limit:
+                cmd.extend(('--since', remote_since_limit))
+            cmd.extend([
+                '%s:%s' % (remote_def.remote_ref_head, remote_def.remote_path),
+                '%s:%s' % ('HEAD', remote_def.local_path),
+            ])
+            subprocess.check_call(cmd, stdout=f)
+
+        if os.path.getsize(patch_filename) == 0:
+            self.console('No changes: %s' % remote_def.get_commit_message())
+            return
+
+        # Apply the patch
+        try:
+            subprocess.check_call(['git', 'checkout', '-b', self.topic_branch])
+            subprocess.check_call(['git', 'am', '--keep-cr', '--3way', patch_filename])
+            subprocess.check_call(['git', 'checkout', self.staging_branch])
+            subprocess.check_call(['git', 'merge', '--no-ff', '--no-commit', self.topic_branch])
+            subprocess.check_call(['git', 'commit', '--allow-empty', '--no-verify', '-m', remote_def.get_commit_message()])
+            subprocess.check_call(['git', 'branch', '-d', self.topic_branch])
+        except Exception as e:
+            failure_message = textwrap.dedent('''
+                There were probably conflicts that need to be resolved in the midst of the
+                last run of git-am. Please resolve your conflicts on the branch and then
+                proceed with:
+                $ git add FILE
+                And then if that resulted in a staged change:
+                $ git am --resolved
+                Or if there were no changes to apply in the resolved conflict.
+                $ git am --skip
+                And then you can continue processing the other remote paths via:
+                $ {script_name} --continue
+                Or if you want to abort the whole process and revert all processed patches:
+                $ {script_name} --abort
+            ''').format(script_name = os.path.basename(__file__))
+            raise Exception(
+                "\n".join([
+                    str(e),
+                    failure_message
+                ])
+            )
+        self.console('Success: %s' % remote_def.get_commit_message())
+
+    def is_on_working_branch(self):
+        return get_checked_out_branch() in (self.staging_branch, self.topic_branch)
+
+    def is_dry_run(self):
+        return self.shelf.get('is_dry_run', False)
+
+    def main(self):
+
+        if self.args.is_abort:
+            self.do_abort()
+            return
+
+        if is_index_dirty() and not self.args.is_continue:
+            raise Exception('Dirty index. Did you forget --continue? There are staged changes.')
+
+        has_remotes = len(self.shelf.get('remotes_manifest', [])) > 0
+        if not has_remotes:
+            raise ScriptException('No remotes were specified')
+        if self.args.is_continue and not self.has_more_remote_defs():
+            raise ScriptException('There is nothing left to continue. You probably need to --abort to reset the initial state.')
+
+        if self.is_dry_run():
+            self.console('DRY RUN')
+
+        try:
+            # --skip: If skip, then abort git-am and return to the staging branch
+            if self.args.is_skip:
+                self.do_skip()
+
+            # --continue: if continuing after a git-am conflict, finalize the topic branch after the git-am resolution
+            elif self.args.is_continue:
+                self.do_continue()
+
+            # Otherwise, check to make sure we don't have a dirty state
+            else:
+                branch_exception = 'The branch %s still exists which indicates the previous run did not finish. You may need to --abort to cleanup.'
+                if is_branch_existing(self.staging_branch):
+                    raise ScriptException(branch_exception % self.staging_branch)
+                if is_branch_existing(self.topic_branch):
+                    raise ScriptException(branch_exception % self.topic_branch)
+
+            # Checkout the staging branch
+            if not is_branch_existing(self.staging_branch):
+                subprocess.check_call(['git', 'branch', self.staging_branch])
+            if get_checked_out_branch() != self.staging_branch:
+                subprocess.check_call(['git', 'checkout', '--quiet', self.staging_branch])
+
+            # Handle any remaining remotes in the manifest
+            while self.has_more_remote_defs():
+                remote_def = self.get_current_remote_def()
+                self.process_remote_def(remote_def)
+                self.next_remote_def()
+
+            # Handle the committed changes
+            initial_head = self.shelf['initial_head']
+            self.console()
+            self.console('#' * 80)
+            commit_message = 'Apply patches from %d remote path(s)' % self.get_remote_def_count()
+            subprocess.check_call(['git', 'checkout', self.shelf['original_branch']])
+            cmd = [
+                'git',
+                'log',
+                '--no-merges',
+                '--pretty=format:%H',
+                'HEAD..%s' % self.staging_branch
+            ]
+            patches_applied_count = len(filter(bool, subprocess.check_output(cmd).strip().split("\n")))
+            if patches_applied_count == 0:
+                self.console('No changes to apply. The paths in the local repo are up to date with their corresponding remote paths.')
+            elif self.is_dry_run():
+                self.console('Dry run would result in:')
+                cmd = [
+                    'git',
+                    '--no-pager',
+                    'log',
+                    '--patch-with-stat',
+                    '--graph',
+                    'HEAD..%s' % self.staging_branch
+                ]
+                subprocess.check_call(cmd)
+                self.console()
+                self.console('Would-be commit message: %s' % commit_message)
+                self.console('%d patch(es) to apply from the remote paths' % patches_applied_count)
+                self.console('(Dry run. None of these changes have been applied.)')
+            else:
+                cmd = [
+                    'git',
+                    'merge',
+                    '--no-ff',
+                    '--log',
+                    '--stat',
+                    '-m', commit_message,
+                    self.staging_branch
+                ]
+                subprocess.check_call(cmd)
+                self.console('Done! New commits added since former HEAD %s:' % initial_head[0:7])
+                self.console('%d patch(es) to apply from the remote paths' % patches_applied_count)
+                subprocess.call(['git', '--no-pager', 'log', '--graph', '%s..HEAD' % initial_head])
+            self.cleanup()
+
+        except KeyboardInterrupt as e:
+            self.do_abort()
+        except Exception as e:
+            self.console(str(e))
+            self.shelf.sync()
+
+
+################################################################################
+
+
+class RemoteDefinition:
+    log_search_pattern_tpl = r'^Apply.* {commit_hash}:{remote_path} *=> *{local_path}'
+    commit_message_tpl = "Apply {commit_hash}:{remote_path} => {local_path} from remote '{remote_name}' ref {remote_ref}"
+    already_fetched_remotes = set()
+    ls_remote_cache = dict()
+
+    def __init__(self, remote_name, remote_ref, local_path, remote_path = None):
+        self.remote_name = remote_name
+        self.remote_ref = remote_ref
+        self.local_path = local_path.strip('/')
+        if not remote_path:
+            self.remote_path = self.local_path
+        else:
+            self.remote_path = remote_path.strip('/')
+        self.remote_ref_head = None
+        self.remote_path_head = None
+
+        # Fetch and cache all of the remote's refs
+        if self.remote_name not in self.ls_remote_cache:
+            ref_lines = subprocess.check_output(['git', 'ls-remote', self.remote_name, self.remote_ref]).strip().split("\n")
+            self.ls_remote_cache[self.remote_name] = dict()
+            for ref_line in ref_lines:
+                (head, ref) = ref_line.split()
+                self.ls_remote_cache[self.remote_name][ref] = head
+
+        # Obtain the remote_ref_head for the remote definition
+        ref_match_count = 0
+        for ref, head in self.ls_remote_cache[self.remote_name].iteritems():
+            if self.remote_ref in ref:
+                self.remote_ref_head = head
+                ref_match_count += 1
+        if ref_match_count == 0:
+            raise ScriptException('Your ref %s is unknown in remote %s.' % (ref, self.remote_name))
+        elif ref_match_count > 1:
+            raise ScriptException('Your ref %s for remote %s is ambigious.' % (ref, self.remote_name))
+
+        # Fetch the remote after obtaining the remote ref head so that it is available locally
+        if self.remote_name not in self.already_fetched_remotes:
+            subprocess.check_call(['git', 'fetch', self.remote_name])
+            self.already_fetched_remotes.add(self.remote_name)
+
+        # Get the last commit that touched this file
+        cmd = [
+            'git',
+            'log',
+            '-1',
+            '--pretty=format:%H',
+            self.remote_ref_head,
+            '--',
+            self.remote_path
+        ]
+        self.remote_path_head = subprocess.check_output(cmd)
+
+    def get_commit_log_search_pattern(self):
+        return self.log_search_pattern_tpl.format(
+            commit_hash = r'([0-9a-fA-F]+)',
+            remote_path = re.escape(self.remote_path),
+            local_path = re.escape(self.local_path),
+        )
+
+    def get_commit_message(self):
+        return self.commit_message_tpl.format(
+            commit_hash = self.remote_path_head[0:7],
+            remote_name = self.remote_name,
+            remote_ref = self.remote_ref,
+            remote_path = self.remote_path,
+            local_path = self.local_path,
+        )
+
+    def __str__(self):
+        return '%s/%s@%s:%s => HEAD:%s' % (self.remote_name, self.remote_ref, self.remote_path_head, self.remote_path, self.local_path)
+
+
+
+################################################################################
+
+def is_git_am_state():
+    return os.path.exists('.git/rebase-apply/applying')
+
+def get_checked_out_branch():
+    return subprocess.check_output(['git', 'rev-parse', '--abbrev-ref', 'HEAD']).strip()
+
+def is_branch_existing(branch_name):
+    return (subprocess.call(['git', 'show-ref', '--verify', '--quiet', 'refs/heads/%s' % branch_name]) == 0)
+
+def is_index_dirty():
+    return (subprocess.call(['git', 'diff-index', '--quiet', '--cached', 'HEAD']) == 1)
+
+################################################################################
+
+
+class ScriptException(Exception):
+    pass
+
+class InvalidManifest(ScriptException):
+    pass
+
+################################################################################
+
+if __name__ == '__main__':
+    try:
+        script = GitApplyRemotePatches(sys.argv[1:])
+        script.main()
+    except Exception as e:
+        print e
+        sys.exit(1)

@@ -1,0 +1,163 @@
+#!/usr/bin/env python
+# git-rev-apply-remote-patches
+# Copyright (C) 2013  X-Team
+# Weston Ruter (@westonruter) <weston@x-team.com>
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+
+'''
+Wrapper for git-apply-remote-patches to do the reverse sync from a remote repo
+to the shared repo
+
+Takes as input a text file that lists out 4 columns:
+
+ 1) The remote "foo" that is syncing with this repo
+ 2) The remote's ref that should be synced from
+ 3) The remote name that the remote uses to refer to this repo (e.g. common)
+ 4) The filename of the remote's remote definition manifest (referring to this repo)
+
+For example:
+
+    foo   common   refs/heads/master path-remote-srcs.txt
+
+Once the script has been invoked, then use the git-apply-remote-patches
+interface to complete the process.
+'''
+
+# todo: Add a --stop option which aborts applying the patches for the current remote path and keep any preceding
+# todo: Add an option to ignore looking through the log to see if the patches have already been applied
+
+import subprocess
+import os
+import argparse
+import sys
+import re
+import textwrap
+import shelve
+import shutil
+import tempfile
+from collections import namedtuple
+
+RevRemoteDefinition = namedtuple('RevRemoteDefinition', ['remote_name', 'remote_ref', 'rev_remote_name', 'manifest_file'])
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=__doc__,
+        epilog='/five'
+    )
+
+    parser.add_argument('--dry-run',
+        action='store_true',
+        help="Skip merging in staging branch at the end",
+        dest='is_dry_run'
+    )
+    parser.add_argument('rev_remotes_manifest',
+        type=str,
+        nargs='+',
+        help="Location of file containing 4-column definition of remote name, the remote's name for this repo, the remote ref to pull from, and filename of the remote's remotes manifest file.",
+    )
+    args = parser.parse_args(argv)
+
+    return args
+
+
+# Instead of re-parsing this, we should re-use the git-apply-remote-patches
+
+def load_rev_remotes_manifest_files(files):
+    manifest = []
+    for rev_remotes_manifest in files:
+        if rev_remotes_manifest == '-':
+            lines = sys.stdin.readlines()
+        else:
+            with open(rev_remotes_manifest) as f:
+                lines = f.readlines()
+
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            cols = re.split(r'\s+', line, 3)
+            if len(cols) != 4:
+                raise Exception('Expected 4 columns but got "%s"' % line)
+            rev_remote_def = RevRemoteDefinition(*cols)
+
+            # Fetch the latest
+            subprocess.check_call(['git', 'fetch', rev_remote_def.remote_name])
+
+            # Get the commit that a remote ref refers to
+            cmd = [
+                'git',
+                'ls-remote',
+                rev_remote_def.remote_name,
+                rev_remote_def.remote_ref
+            ]
+            lines = filter(bool, subprocess.check_output(cmd).strip().split("\n"))
+            if len(lines) == 0:
+                raise Exception('Unable to find %s in %s' % (rev_remote_def.remote_ref, rev_remote_def.remote_name))
+            if len(lines) > 1:
+                raise Exception('The ref "%s" is ambiguous in %s' % (rev_remote_def.remote_ref, rev_remote_def.remote_name))
+            (commit, ref) = re.split('\s+', lines[0], 1)
+
+            # Now get the remote file
+            cmd = [
+                'git',
+                'cat-file',
+                '-p',
+                '%s:%s' % (commit, rev_remote_def.manifest_file)
+            ]
+            remotes_manifest = subprocess.check_output(cmd)
+            for line in remotes_manifest.split("\n"):
+                if not line.strip() or line.startswith('#'):
+                    continue
+                cols = re.split(r'\s+', line, 3)
+                if len(cols) == 3:
+                    cols.append(cols[-1])
+                if cols[0] == rev_remote_def.rev_remote_name:
+                    cols[0] = rev_remote_def.remote_name
+                    cols[1] = rev_remote_def.remote_ref
+                    (cols[2], cols[3]) = (cols[3], cols[2])
+                    manifest.append(cols)
+
+    return "\n".join(["\t".join(cols) for cols in manifest]) + "\n"
+
+def main(args):
+    args = parse_args(args)
+
+    remotes_manifest = load_rev_remotes_manifest_files(args.rev_remotes_manifest)
+    f = tempfile.NamedTemporaryFile(prefix='rev-remotes-manifest')
+    f.write(remotes_manifest)
+
+    cmd = [
+        'python',
+        os.path.dirname(__file__) + '/git-apply-remote-patches',
+    ]
+    if args.is_dry_run:
+        cmd.append('--dry-run')
+    cmd.append('-')
+
+    pipe = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    pipe.stdin.write(remotes_manifest)
+    pipe.stdin.close()
+    retcode = pipe.wait()
+
+    f.close()
+    return retcode
+
+
+
+if __name__ == '__main__':
+    retcode = main(sys.argv[1:])
+    sys.exit(retcode)
