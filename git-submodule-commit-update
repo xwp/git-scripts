@@ -1,0 +1,95 @@
+#!/bin/bash
+# git-submodule-commit-update
+# Copyright (C) 2014  XWP
+# Weston Ruter (@westonruter) <weston@xwp.co>
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+
+set -e
+
+submodule_path="$1"
+
+show_usage()
+{
+echo "
+USAGE:
+git add path-to-submodule && git-submodule-commit-update path-to-submodule
+
+When submodule repos have new commits in them, commit the updated reference with a
+a helpful commit message in the super repo, including the commit range that the
+submodule repo was updated and a oneline git log. Make sure that the submodule's
+commits are pushed up to the repo as well. This does not push the commits for the
+parent repo.
+"
+}
+
+while getopts "h:a:p" OPTION
+do
+	case $OPTION in
+		h)
+			show_usage
+			exit 1
+			;;
+		?)
+			show_usage
+			exit 1
+			;;
+	esac
+done
+
+submodule_path=$(sed 's:/$::' <<< "$submodule_path")
+
+if [ -z "$submodule_path" ]; then
+	show_usage
+	exit 1
+fi
+if [ ! -d "$submodule_path" ]; then
+	echo "Non-existent directory: $submodule_path"
+fi
+if [ ! -e "$submodule_path/.git" ]; then
+	echo "Not a Git repo at $submodule_path"
+fi
+
+cd $submodule_path
+
+if grep -s github <<< "$(git config remote.origin.url)"; then
+	org_repo=$(git config remote.origin.url | sed 's=.*github\.com[/:]==' | sed 's:\.git$::')
+	org=$(sed 's:/.*::' <<< "$org_repo")
+	name=$(sed 's:.*/::' <<< "$org_repo")
+	sedarg='s:Merge pull request \(#[0-9][0-9]*\) from '$org'/\([a-zA-Z0-9_-][a-zA-Z0-9_-]*\):Merge pull request '$org/$name'\1 from branch \2:g'
+else
+	name=$(basename "$submodule_path")
+	sedarg='s:THISISAHACKANDSHOULDBEELIMINATED::'
+fi
+cd - > /dev/null
+
+if ! git diff --staged --quiet -- $submodule_path; then
+	old_sha1=$(git diff --staged -- $submodule_path | grep "Subproject commit" | cut -c20-26 | head -n 1)
+	new_sha1=$(git diff --staged -- $submodule_path | grep "Subproject commit" | cut -c20-26 | tail -n 1)
+
+	cd $submodule_path
+	git show -s --format="Update $name $old_sha1...$new_sha1: %s" $new_sha1 | sed "$sedarg" > /tmp/GITSUBMODULE_COMMIT_MSG
+	if grep -s github <<< "$(git config remote.origin.url)"; then
+		echo "https://github.com/$org/$name/compare/$old_sha1...$new_sha1" >> /tmp/GITSUBMODULE_COMMIT_MSG
+	fi
+	echo >> /tmp/GITSUBMODULE_COMMIT_MSG
+	git --no-pager log --reverse --oneline $old_sha1...$new_sha1 | sed "$sedarg" >> /tmp/GITSUBMODULE_COMMIT_MSG
+	cd - > /dev/null
+
+	git add $submodule_path
+	git commit --edit -F /tmp/GITSUBMODULE_COMMIT_MSG
+else
+	echo "Nothing to do"
+fi
