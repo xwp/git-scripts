@@ -1,0 +1,33 @@
+#!/bin/bash
+# Update Git and SVN repos checked out in the same directory.
+#
+# Pass a branch name like 4.6 as the sole argument to checkout that branch. Otherwise, master/trunk is checked out.
+
+set -ex
+
+cd "$(dirname $0)"
+
+git fetch origin --tags
+
+git_branch=master
+svn_path='^/trunk'
+if [ ! -z "$1" ] && [ "$1" != 'master' ] && [ "$1" != 'trunk' ]; then
+	git_branch=$1
+	svn_path="^/branches/$1"
+fi
+
+git stash save
+svn switch --force $svn_path --ignore-externals
+git checkout -f $git_branch
+git reset --hard origin/$git_branch
+svn up --force --accept=theirs-full --ignore-externals
+
+set +x
+
+echo
+echo "## svn status"
+svn status | grep -Ev '^\?'
+
+echo
+echo "## git status"
+git status -uno
