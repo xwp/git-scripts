@@ -32,10 +32,14 @@ git reset --hard origin/$git_branch
 svn up --force --accept=theirs-full --ignore-externals
 
 set +x
-
+set +e
 echo
+echo "----------------------------"
+
 echo "## svn status"
-svn status | grep -Ev '^\?'
+if ! svn status --ignore-externals | grep -Ev '^(\?|\X)'; then
+	echo 'nothing to commit'
+fi
 
 echo
 echo "## git status"
