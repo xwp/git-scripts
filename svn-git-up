@@ -27,6 +27,7 @@ fi
 
 git stash save
 svn switch --force $svn_path --ignore-externals
+svn revert -R .
 git checkout -f $git_branch
 git reset --hard origin/$git_branch
 svn up --force --accept=theirs-full --ignore-externals
